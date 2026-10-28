@@ -7,6 +7,9 @@ A Windows desktop replacement for NCLite: sends CNC programs to machine controls
 - C++17, Qt 6 (Widgets + SerialPort), CMake
 - **Fully offline.** It makes no network calls, sends no telemetry, has no auto-update, and doesn't link Qt Network. Everything it writes stays in its own folder.
 - Profiles, settings and the transfer log are plain files next to the exe.
+- **Open source** under the [MIT License](LICENSE). The released exe also contains Qt, used under the LGPLv3; see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+**Download:** the latest standalone `NCSender.exe` is on the [Releases page](https://github.com/MylanMachine/NCSender/releases/latest).
 
 ---
 
