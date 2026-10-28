@@ -1,0 +1,9 @@
+build/
+build-standalone/
+dist/
+out/
+tests/out/
+.vs/
+CMakeUserPresets.json
+*.user
+*.log
