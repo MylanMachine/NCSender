@@ -10,13 +10,16 @@
 #include "TransferTypes.h"
 
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QSerialPort>
 #include <QSerialPortInfo>
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QTimer>
 
+#include <algorithm>
 #include <functional>
 
 #ifdef Q_OS_WIN
@@ -365,6 +368,85 @@ private slots:
         QVERIFY(runs.wait(10000));
         QCOMPARE(ctl.data(), ProgramFormatter::format(readFile(file), p));
         ch.cancel();
+    }
+
+    void drip_stopsWithinTenCharactersOfXoffAndPacesAtLineRate()
+    {
+        // A Fanuc raises alarm 087 if more than ~10 characters arrive after
+        // it sends XOFF. Hold the sender every 500 characters, once for longer
+        // than any stall warning, and count what still arrives.
+        QTemporaryDir dir;
+        Control ctl(QStringLiteral("COM11"));
+        QVERIFY(ctl.ok());
+        QByteArray program = "%\nO7002\n";
+        for (int i = 0; program.size() < 3000; ++i)
+            program += QStringLiteral("G01 X%1.123 Y%2.456 F500.\n").arg(i % 97).arg(i % 89).toLatin1();
+        program += "M30\n%\n";
+        const QString file = dir.filePath(QStringLiteral("O7002.nc"));
+        QVERIFY(writeFile(file, program));
+        const MachineProfile p = profileFor(QStringLiteral("COM10"), dir.path());
+        MachineProfile noTrailer = p;
+        noTrailer.trailerCount = 0;
+        const QByteArray expected = ProgramFormatter::format(program, noTrailer);
+
+        qsizetype xoffAt = -1;
+        qsizetype nextHold = 500;
+        int holds = 0;
+        qsizetype worstOverrun = 0;
+        ctl.onData([&](const QByteArray& all) {
+            if (xoffAt >= 0) {
+                worstOverrun = std::max(worstOverrun, all.size() - xoffAt);
+            } else if (all.size() >= nextHold && !all.endsWith(expected)) {
+                xoffAt = all.size();
+#ifdef Q_OS_WIN
+                // Straight onto the wire, as a control does. QSerialPort's
+                // asynchronous write can take ~15 ms to start here, and what
+                // arrives meanwhile is not the sender's overrun.
+                ::TransmitCommChar(reinterpret_cast<HANDLE>(ctl.port().handle()), '\x13');
+#else
+                ctl.send(QByteArray(1, '\x13'));
+#endif
+                const int holdMs = holds++ == 1 ? 4000 : 400;
+                QTimer::singleShot(holdMs, &ctl.port(), [&] {
+                    xoffAt = -1;
+                    nextHold = ctl.data().size() + 500;
+                    ctl.send(QByteArray(1, '\x11'));
+                });
+            }
+        });
+
+        MachineChannel ch(QStringLiteral("A"));
+        QSignalSpy runs(&ch, &MachineChannel::runFinished);
+        QSignalSpy done(&ch, &MachineChannel::finished);
+        qint64 progressAhead = 0;
+        QObject::connect(&ch, &MachineChannel::progress, &ch, [&](qint64 sent, qint64) {
+            progressAhead = std::max(progressAhead, sent - qint64(ctl.data().size()));
+        });
+        QVERIFY(ch.startSend(p, SendRequest{file, SendRequest::Mode::DripFeed}));
+        QTest::qWait(500);
+        QElapsedTimer clock;
+        clock.start();
+        ctl.send(QByteArray(1, '\x11'));
+        QVERIFY(runs.wait(60000));
+        const qint64 elapsed = clock.elapsed();
+
+        const TransferResult r = runs.first().first().value<TransferResult>();
+        QCOMPARE_ENUM(r.outcome, TransferOutcome::Success);
+        QCOMPARE(r.bytesTransferred, qint64(expected.size()));
+        QCOMPARE(ctl.data(), expected);
+        QVERIFY(done.isEmpty()); // the long hold was not treated as an error
+        QVERIFY(holds >= 5);
+        QVERIFY2(worstOverrun <= 10, qPrintable(QStringLiteral("%1 characters after XOFF").arg(worstOverrun)));
+        // Progress counts bytes that have left the port; this end reads them a
+        // few characters late. Counting bytes handed to the driver would put
+        // it hundreds ahead.
+        QVERIFY2(progressAhead <= 10, qPrintable(QStringLiteral("progress ran %1 bytes ahead").arg(progressAhead)));
+        // Never faster than the line: 11 bits per character at 9600 baud.
+        const qint64 lineMs = qint64(expected.size()) * 11 * 1000 / 9600;
+        QVERIFY2(elapsed >= lineMs, qPrintable(QStringLiteral("%1 ms < %2 ms").arg(elapsed).arg(lineMs)));
+
+        ch.cancel();
+        QVERIFY(done.wait(3000));
     }
 
     void drip_missingFileWhenRearmingStopsWithError()

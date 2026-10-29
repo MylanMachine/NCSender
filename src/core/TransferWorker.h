@@ -26,6 +26,11 @@ namespace nc {
 //   - progress reflects what has actually left the PC
 //   - cancel only has to discard a small buffer
 //
+// Drip feed is stricter: a Fanuc allows only ~10 characters after XOFF, and
+// a USB adapter reports bytes written as soon as they reach its own FIFO. So
+// drip feed writes one byte at a time at no more than the line rate, and
+// checks for XOFF itself before every byte (see dripPump).
+//
 // Drip feed (SendRequest::Mode::DripFeed) stays armed until cancelled: each
 // time the control sends XON (Cycle Start in Remote mode) the program is
 // streamed again, re-read from disk. The port stays open between runs, and
@@ -67,6 +72,7 @@ private:
     // send
     void beginSending();
     void pump();
+    void dripPump();
     bool writeChunk(const QByteArray& chunk);
     void checkSendComplete();
     void onDrainTick();
@@ -130,7 +136,10 @@ private:
     bool m_drainGuardStarted = false;
     QElapsedTimer m_drainGuard;
     qint64 m_queued = 0;  // bytes handed to QSerialPort
-    qint64 m_written = 0; // bytes the driver reported as written
+    qint64 m_written = 0; // bytes the driver reported as written (drip feed: bytes that left the port)
+    bool m_inFlight = false;     // drip feed: one byte written, not yet counted as sent
+    bool m_xoffReceived = false; // drip feed: last XON/XOFF seen in the input was XOFF
+    qint64 m_nextByteNs = 0;     // drip feed: earliest m_clock time for the next byte
 
     // receive state
     QByteArray m_rx;

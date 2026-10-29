@@ -31,6 +31,7 @@ constexpr qint64 kHighWater = 256;  // max bytes waiting inside QSerialPort
 constexpr int kStatusPollMs = 250;
 constexpr int kStallWarnMs = 3000;
 constexpr int kDrainPollMs = 50;
+constexpr int kHoldPollMs = 5; // drip feed: how often to look again while held
 constexpr qint64 kMaxReceiveBytes = 64LL * 1024 * 1024;
 
 QSerialPort::Parity toQt(Parity p)
@@ -139,6 +140,12 @@ QString formatBytes(qint64 n)
 QString formatSeconds(qint64 ms)
 {
     return QString::number(ms / 1000.0, 'f', 1);
+}
+
+// Whole milliseconds from now until a deadline, at least 1.
+int msUntil(qint64 deadlineNs, qint64 nowNs)
+{
+    return int(std::clamp<qint64>((deadlineNs - nowNs + 999999) / 1000000, 1, 60000));
 }
 
 } // namespace
@@ -457,6 +464,9 @@ void TransferWorker::beginSending()
         // A run is timed from Cycle Start, not from when it was armed.
         m_result.started = QDateTime::currentDateTime();
         m_clock.restart();
+        m_inFlight = false;
+        m_xoffReceived = false;
+        m_nextByteNs = 0;
     }
     m_sending = true;
     m_lastActivity.restart();
@@ -490,6 +500,10 @@ void TransferWorker::pump()
     if (m_mode != Mode::Send || !m_sending || m_draining || m_errorQueued || !m_source)
         return;
 
+    if (m_dripFeed) {
+        dripPump();
+        return;
+    }
     if (m_profile.charDelayMs > 0) {
         // One character at a time, each after the previous one has been
         // accepted by the driver, then the configured pause.
@@ -525,10 +539,83 @@ void TransferWorker::pump()
     checkSendComplete();
 }
 
+// Drip feed: one byte at a time, never faster than the line rate. A Fanuc
+// accepts only about 10 more characters after it sends XOFF, so nothing may
+// pile up between here and the wire. A byte is written only when:
+//   - the previous one has left: Qt and the driver have nothing queued and a
+//     full character time has passed (a USB adapter reports a write done as
+//     soon as the byte reaches its FIFO, so the time is what bounds it)
+//   - the control is not holding us: no XOFF in the input, and the driver
+//     does not report an XOFF/CTS hold
+//   - the profile's character delay has passed since the previous byte
+// The driver's own XON/XOFF stays on as a backstop. A hold never times out;
+// only cancel or a port error ends it.
+void TransferWorker::dripPump()
+{
+    if (m_mode != Mode::Send || !m_sending || m_draining || m_errorQueued || !m_source)
+        return;
+    if (m_port->bytesToWrite() > 0)
+        return; // onBytesWritten calls back once the driver has the byte
+
+    const PortStatus st = queryPortStatus();
+    const bool held = m_xoffReceived || (st.ok && (st.xoffHold || st.ctsHold));
+    const qint64 now = m_clock.nsecsElapsed();
+
+    if (m_inFlight) {
+        if (st.outQueue > 0 || now < m_nextByteNs) {
+            m_pumpTimer->start(held ? kHoldPollMs : msUntil(m_nextByteNs, now));
+            return;
+        }
+        // Only now is the byte counted as sent.
+        m_inFlight = false;
+        ++m_written;
+        m_lastActivity.restart();
+        if (m_state == TransferState::Paused)
+            setState(TransferState::Sending, sendingMessage());
+        emitProgress(false);
+    }
+
+    if (m_source->atEnd()) {
+        checkSendComplete();
+        return;
+    }
+    if (held) {
+        m_pumpTimer->start(kHoldPollMs);
+        return;
+    }
+    if (now < m_nextByteNs) {
+        m_pumpTimer->start(msUntil(m_nextByteNs, now));
+        return;
+    }
+
+    const QByteArray one = m_source->read(1);
+    if (one.isEmpty()) {
+        if (const QString err = m_source->error(); !err.isEmpty()) {
+            finish(TransferOutcome::Failed, err);
+            return;
+        }
+        m_pumpTimer->start(20); // source has nothing ready yet
+        return;
+    }
+    if (!writeChunk(one))
+        return;
+    m_inFlight = true;
+
+    // At most one character of catch-up after a late timer or a hold, so the
+    // average rate tracks the line rate without ever letting a burst through.
+    const double bits = bitsPerCharacter(m_profile.dataBits, m_profile.parity, m_profile.stopBits);
+    const qint64 charNs = qint64(bits * 1e9 / qMax(1, m_profile.baudRate));
+    m_nextByteNs = std::max(m_nextByteNs, now - charNs) + charNs + qint64(m_profile.charDelayMs) * 1000000;
+}
+
 void TransferWorker::onBytesWritten(qint64 bytes)
 {
     if (m_mode != Mode::Send || !m_sending)
         return;
+    if (m_dripFeed) {
+        dripPump(); // counts the byte itself once it has left the port
+        return;
+    }
     m_written += bytes;
     m_lastActivity.restart();
     if (m_state == TransferState::Paused)
@@ -688,7 +775,7 @@ void TransferWorker::onStatusPoll()
         return;
 
     const PortStatus st = queryPortStatus();
-    const bool xoffHold = st.ok && st.xoffHold;
+    const bool xoffHold = (st.ok && st.xoffHold) || m_xoffReceived;
     const bool ctsHold = st.ok && st.ctsHold;
 
     if ((xoffHold || ctsHold) && m_dripFeed) {
@@ -975,6 +1062,16 @@ void TransferWorker::onReadyRead()
         if (m_waitingForXon && data.lastIndexOf(kXon) > data.lastIndexOf(kXoff)) {
             setState(TransferState::Sending, QStringLiteral("XON received, starting"));
             beginSending();
+        } else if (m_sending && m_dripFeed) {
+            // The driver normally consumes XON/XOFF and reports the hold
+            // instead, but some adapters pass them through: honor those too.
+            const qsizetype xon = data.lastIndexOf(kXon);
+            const qsizetype xoff = data.lastIndexOf(kXoff);
+            if (xon >= 0 || xoff >= 0) {
+                m_xoffReceived = xoff > xon;
+                if (!m_xoffReceived)
+                    dripPump();
+            }
         }
         // Anything else the control sends during a send is ignored.
         return;
